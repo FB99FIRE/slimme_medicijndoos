@@ -15,13 +15,13 @@ QueueHandle_t keyQueue;                // numpad -> control: ingedrukte toetsen
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 Servo myservo;
 
-// De enige variabele die door twee tasks wordt gedeeld:
-// vLDRTask schrijft, vServoBuzzerTask leest. Eén schrijver, één lezer en één byte,
-// dus volatile is hier genoeg op de ESP32.
-volatile bool doosDicht = true;
+// boolean om mee aan te geven dat de LDR licht ziet.
+volatile bool lichtGezien = true;
 
+// ---------------------------------------------------------------
 // Toestanden van het systeem. De huidige toestand is een lokale variabele in
 // vControlTask, dus geen enkele andere task kan hem aanpassen.
+// ---------------------------------------------------------------
 enum class Toestand
 {
   Invoer,  // gebruiker typt het aantal seconden
@@ -30,20 +30,21 @@ enum class Toestand
   Sluiten  // gebruiker drukte op '#': servo sluit de doos
 };
 
-// In een .cpp-bestand moeten functies gedeclareerd zijn voordat ze worden gebruikt
-// (een .ino-bestand doet dat automatisch).
 char decodeKey(uint8_t code);
 void toonScherm(const char *regel0, const char *regel1);
 void toonStartscherm();
 void toonInvoer(const String &invoer);
 bool rondeIsKlaar();
-void openDoosEnAlarm();
+void openDoos();
 void sluitDoos();
 void vNumpadTask(void *pvParameters);
 void vControlTask(void *pvParameters);
 void vServoBuzzerTask(void *pvParameters);
 void vLDRTask(void *pvParameters);
 
+// ---------------------------------------------------------------
+// setup() wordt één keer uitgevoerd bij het opstarten van de ESP32. Hierin worden de RTOS-objecten aangemaakt en de tasks gestart.
+// ---------------------------------------------------------------
 void setup()
 {
   Serial.begin(115200);
@@ -70,23 +71,28 @@ void setup()
 
   myservo.attach(32);
   pinMode(buzzerPin, OUTPUT);
-
+  // De buzzer gebruikt de tone()-functie, die een timer gebruikt. De ESP32 heeft meerdere timers, dus we kunnen een andere timer gebruiken dan de servo. We kiezen hier voor kanaal 2.
+  setToneChannel(2);
   // Prioriteiten:
   // - ServoBuzzer (3): hoogste, moet direct reageren als het alarm afgaat.
   // - Numpad en Control (2): verwerken de invoer van de gebruiker.
   // - LDR (1): laagste, leest alleen de lichtsensor.
+  xTaskCreate(vServoBuzzerTask, "ServoBuzzerTask", 4096, NULL, 3, NULL);
   xTaskCreate(vNumpadTask, "NumpadTask", 4096, NULL, 2, NULL);
   xTaskCreate(vControlTask, "ControlTask", 4096, NULL, 2, NULL);
   xTaskCreate(vLDRTask, "LDRTask", 4096, NULL, 1, NULL);
-  xTaskCreate(vServoBuzzerTask, "ServoBuzzerTask", 4096, NULL, 3, NULL);
 }
-
+// ---------------------------------------------------------------
 // loop() doet niets: de taak blokkeert zodat de andere tasks alle CPU-tijd krijgen.
+// ---------------------------------------------------------------
 void loop()
 {
   vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
+//---------------------------------------------------------------
+// geeft de toets terug die bij de code hoort, of '?' als de code onbekend is.
+//---------------------------------------------------------------
 char decodeKey(uint8_t code)
 {
   switch (code)
@@ -118,7 +124,9 @@ char decodeKey(uint8_t code)
   }
   return '?';
 }
-
+//---------------------------------------------------------------
+// toonScherm() toont de gegeven regels op het LCD-schermpje.
+// ---------------------------------------------------------------
 // Alle LCD-toegang loopt via toonScherm() en toonInvoer(), zodat de mutex
 // altijd wordt gebruikt.
 void toonScherm(const char *regel0, const char *regel1)
@@ -133,7 +141,9 @@ void toonScherm(const char *regel0, const char *regel1)
     xSemaphoreGive(lcdMutex);
   }
 }
-
+// ---------------------------------------------------------------
+// pakt de mutex, toont de invoerregel op het lcd schermpje en geeft de mutex weer vrij.
+// ---------------------------------------------------------------
 void toonInvoer(const String &invoer)
 {
   if (xSemaphoreTake(lcdMutex, portMAX_DELAY) == pdTRUE)
@@ -144,44 +154,46 @@ void toonInvoer(const String &invoer)
     xSemaphoreGive(lcdMutex);
   }
 }
-
+// ---------------------------------------------------------------
+// startscherm tonen bij opstarten of na afronden van een ronde.
+// ---------------------------------------------------------------
 void toonStartscherm()
 {
   // In één keer, zodat de regel "Invoer:" niet even ontbreekt.
   toonScherm("MedicijnDoos", "Voer seconden in");
 }
 
+// ---------------------------------------------------------------
 // Geeft true als de servo/buzzer-task meldt dat de ronde klaar is.
 // Alleen de control-task roept deze functie aan.
+// ---------------------------------------------------------------
 bool rondeIsKlaar()
 {
-  if (xSemaphoreTake(rondeKlaarSemaphore, 0) != pdTRUE)
-    return false;
-
-  // De servo/buzzer-task is nu klaar en wacht weer op de volgende timer.
-  // Een '#' die te laat kwam (doos was al met de hand dicht) mag niet
-  // doorsijpelen naar de volgende ronde, dus dat signaal ruimen we op.
-  xSemaphoreTake(sluitDoosSemaphore, 0);
-  return true;
+  return xSemaphoreTake(rondeKlaarSemaphore, 0) != pdTRUE;
 }
 
-void openDoosEnAlarm()
+// ---------------------------------------------------------------
+// opent de doos.
+// ---------------------------------------------------------------
+void openDoos()
 {
-  Serial.println("Alarm! Servo open + buzzer aan");
+  Serial.println("Alarm! Servo open");
   for (int pos = 0; pos <= 180; pos++)
   {
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(10));
     myservo.write(pos);
   }
-  tone(buzzerPin, 440);
 }
 
+// ---------------------------------------------------------------
+// sluit de doos.
+// ---------------------------------------------------------------
 void sluitDoos()
 {
   Serial.println("Doos wordt gesloten");
   for (int pos = 180; pos >= 0; pos--)
   {
-    vTaskDelay(pdMS_TO_TICKS(5));
+    vTaskDelay(pdMS_TO_TICKS(10));
     myservo.write(pos);
   }
 }
@@ -284,10 +296,6 @@ void vControlTask(void *pvParameters)
         toestand = Toestand::Sluiten;
         xSemaphoreGive(sluitDoosSemaphore);
       }
-      else if (rondeIsKlaar()) // de doos is met de hand gesloten
-      {
-        nieuweRonde();
-      }
       break;
 
     case Toestand::Sluiten:
@@ -314,25 +322,23 @@ void vServoBuzzerTask(void *pvParameters)
 
     // toonScherm("ALARM actief", "Sluit de doos", "Druk op #");
     toonScherm("ALARM actief", "Druk op #");
-    openDoosEnAlarm();
+    openDoos();
 
-    // 2. wachten tot de doos dicht is. Dat kan op twee manieren:
-    //    - de gebruiker sluit de doos met de hand: de LDR-task meldt dan doosDicht
-    //    - de gebruiker drukt op '#': dan sluit de servo de doos
-    bool servoGesloten = false;
-    while (!doosDicht)
+    // 2. wachten op '#'. Zodra de LDR licht ziet (de klep is open) gaat de buzzer
+    //    aan. Hij blijft aan tot '#' wordt geselecteerd om weer sluiten.
+    bool buzzerAan = false;
+    while (xSemaphoreTake(sluitDoosSemaphore, pdMS_TO_TICKS(100)) != pdTRUE)
     {
-      if (xSemaphoreTake(sluitDoosSemaphore, pdMS_TO_TICKS(100)) == pdTRUE)
+      if (lichtGezien && !buzzerAan)
       {
-        sluitDoos();
-        servoGesloten = true;
+        tone(buzzerPin, 440);
+        buzzerAan = true;
       }
     }
 
-    // 3. de doos is dicht: buzzer uit en de servo in de gesloten stand
+    // 3. '#' ingedrukt: buzzer uit en de servo sluit de doos    noTone(buzzerPin);
     noTone(buzzerPin);
-    if (!servoGesloten)
-      sluitDoos();
+    sluitDoos();
 
     toonScherm("Ronde klaar", "Voer opnieuw in.");
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -350,7 +356,7 @@ void vLDRTask(void *pvParameters)
   while (true)
   {
     int LDRValue = analogRead(LDRPIN);
-    doosDicht = (LDRValue < LDR_THRESHOLD);
+    lichtGezien = (LDRValue < LDR_THRESHOLD);
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
